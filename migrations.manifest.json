@@ -1,0 +1,9 @@
+{
+  "0001_initial.sql": "c4bad115e9972f993425c6b637ec1f87d502dcfc38ca2439e6a65877c52bda65",
+  "0002_indexes.sql": "db1a6f2e42b2459e08a95dbf412b7ad31ae457e94dd5fcbfdca7c641cb001750",
+  "0003_bookings.sql": "7af73b8e0944473743a0fac785da85480340a4a779d3ada0f11cbcbbf93bd793",
+  "0004_qr_checkout_checkin.sql": "a0d33d6d85ebfb2475f5aa23f42daac0de681f9a123f0a7d97f30863581f8260",
+  "0005_lifecycle_admin_override.sql": "a494870df3990444c65a89cfde80c3a908c9f14c99fa9c1b94453e4f3f77aba7",
+  "0006_lifecycle_override_metadata.sql": "a0a038cf2abc9076159a70e43129260fa3c07a3ed9722073847194d829827e4c",
+  "0007_qr_encrypted_token.sql": "e66c18b1f0f9a3aa03ada3cb8a3a31e5ded9851a8304af3f1745ee0042b20c25"
+}

@@ -1,0 +1,118 @@
+name: Increment 3 and 4 Acceptance
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Verify checkout and source fingerprints
+        id: fingerprints
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f resource_platform/application.py
+          test -f scripts/ci_acceptance.py
+          test -z "$(git status --porcelain)"
+          echo "commit=$(git rev-parse HEAD)"
+          echo "application_sha256=$(sha256sum resource_platform/application.py | cut -d' ' -f1)"
+          echo "acceptance_sha256=$(sha256sum scripts/ci_acceptance.py | cut -d' ' -f1)"
+
+      - name: Create clean virtual environment
+        run: python -m venv .venv
+
+      - name: Install project and test dependencies
+        run: |
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[test]"
+
+      - name: Verify QR dependencies
+        run: .venv/bin/python -c "import qrcode, cv2, cryptography; print('dependencies available')"
+
+      - name: Run complete test suite with QR decoder
+        env:
+          RUN_QR_DECODER_TESTS: "1"
+        run: |
+          set -o pipefail
+          .venv/bin/python -m unittest discover -s tests -v 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          if grep -Eq 'skipped=[1-9][0-9]*|FAILED|ERROR' "$RUNNER_TEMP/test-output.log"; then
+            echo "Acceptance suite contains failures, errors, or skipped tests"
+            exit 1
+          fi
+
+      - name: Compile Python sources
+        run: .venv/bin/python -m compileall -q resource_platform tests scripts
+
+      - name: Verify migration manifest
+        run: .venv/bin/python -c "from resource_platform.database import verify_migration_integrity; verify_migration_integrity(); print('migration integrity verified')"
+
+      - name: Run fresh and repeated migrations
+        env:
+          DATABASE_PATH: ${{ runner.temp }}/resource-platform-mvp.sqlite3
+        run: |
+          rm -f "$DATABASE_PATH"
+          first="$(${{ github.workspace }}/.venv/bin/python -m resource_platform.database migrate --database-path "$DATABASE_PATH")"
+          second="$(${{ github.workspace }}/.venv/bin/python -m resource_platform.database migrate --database-path "$DATABASE_PATH")"
+          printf '%s\n%s\n' "$first" "$second"
+          echo "$first" | grep -F '(7 migration(s) applied).'
+          echo "$second" | grep -F '(0 migration(s) applied).'
+
+      - name: Seed isolated acceptance database
+        env:
+          DATABASE_PATH: ${{ runner.temp }}/resource-platform-mvp.sqlite3
+        run: .venv/bin/python -m resource_platform.seed
+
+      - name: Start application and verify HTTP flows
+        env:
+          DATABASE_PATH: ${{ runner.temp }}/resource-platform-mvp.sqlite3
+          SESSION_SECRET: ci-session-secret-2026
+          QR_TOKEN_ENCRYPTION_KEY: ${{ secrets.CI_QR_TOKEN_ENCRYPTION_KEY }}
+          APP_ENV: test
+          HOST: 127.0.0.1
+          PORT: "8765"
+        run: |
+          set -euo pipefail
+          if [ -z "${QR_TOKEN_ENCRYPTION_KEY:-}" ]; then
+            QR_TOKEN_ENCRYPTION_KEY="$(.venv/bin/python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+            export QR_TOKEN_ENCRYPTION_KEY
+          fi
+          log_path="${RUNNER_TEMP}/resource-platform.log"
+          : > "$log_path"
+          .venv/bin/python -m resource_platform >"$log_path" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          export CI_COMMIT_SHA="$(git rev-parse HEAD)"
+          .venv/bin/python scripts/ci_acceptance.py \
+            --host 127.0.0.1 \
+            --port 8765 \
+            --database "$DATABASE_PATH" \
+            --log-path "$log_path" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-application-hash "$(sha256sum resource_platform/application.py | cut -d' ' -f1)" \
+            --expected-script-hash "$(sha256sum scripts/ci_acceptance.py | cut -d' ' -f1)"
+
+      - name: Upload server log on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-platform-server-log
+          path: ${{ runner.temp }}/resource-platform.log
+          if-no-files-found: warn

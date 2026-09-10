@@ -9,7 +9,6 @@ from __future__ import annotations
 import os
 import unittest
 import tempfile
-import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -51,8 +50,10 @@ class BackendFixture(unittest.TestCase):
                 raise AssertionError(f"wrong repository backend: {cls.backend.name}")
             with cls.backend.transaction() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT current_schema(), current_database()")
-                    cls.schema_name = cur.fetchone()[0]
+                    cur.execute("SELECT current_schema() AS schema_name, current_database() AS database_name")
+                    row = cur.fetchone()
+                    cls.schema_name = row["schema_name"]
+                    cls.database_name = row["database_name"]
             cls._prepare_postgresql_data()
         elif cls.backend_name == "sqlite":
             fd, path = tempfile.mkstemp(prefix="repo-test-", suffix=".sqlite3")
@@ -86,8 +87,9 @@ class BackendFixture(unittest.TestCase):
         cur = cls.backend.execute(conn, sql, params)
         if cls.backend_name == "postgresql":
             with conn.cursor() as c:
-                c.execute("SELECT lastval()")
-                return c.fetchone()[0]
+                c.execute("SELECT lastval() AS last_id")
+                row = c.fetchone()
+                return row["last_id"]
         return cur.lastrowid
 
     @classmethod
@@ -141,7 +143,7 @@ class BackendFixture(unittest.TestCase):
 
         with TransactionService(self.backend).transaction() as conn:
             self.assertEqual(ResourceRepository(self.backend, conn).by_id(1)["name"], "Renamed")
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM audit_logs").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) AS row_count FROM audit_logs").fetchone()["row_count"], 1)
 
     def test_transaction_rollback_and_recovery(self):
         with self.assertRaises(RuntimeError):
@@ -150,7 +152,7 @@ class BackendFixture(unittest.TestCase):
                 raise RuntimeError("expected rollback")
         with TransactionService(self.backend).transaction() as conn:
             self.assertIsNone(UserRepository(self.backend, conn).by_email("rollback@example.test"))
-            self.assertEqual(conn.execute("SELECT 1").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT 1 AS ok").fetchone()["ok"], 1)
 
     def test_audit_write_is_transactional(self):
         with self.assertRaises(RuntimeError):
@@ -158,7 +160,7 @@ class BackendFixture(unittest.TestCase):
                 AuditRepository(self.backend, conn).record(1, "rollback", "resource", 1, "repository")
                 raise RuntimeError("force rollback")
         with TransactionService(self.backend).transaction() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM audit_logs WHERE action = 'rollback'").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) AS row_count FROM audit_logs WHERE action = 'rollback'").fetchone()["row_count"], 0)
 
 
 if __name__ == "__main__":

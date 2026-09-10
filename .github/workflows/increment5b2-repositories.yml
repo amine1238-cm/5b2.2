@@ -1,0 +1,178 @@
+name: Increment 5B2.2 Repository Verification
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "resource_platform/database_backend.py"
+      - "resource_platform/time_handling.py"
+      - "resource_platform/transaction_service.py"
+      - "resource_platform/repositories/**"
+      - "tests/test_repository_infrastructure.py"
+      - "tests/test_repositories.py"
+      - "tests/test_repositories_backend.py"
+      - "tests/test_time_handling.py"
+      - ".github/workflows/increment5b2-repositories.yml"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  sqlite-regression:
+    name: SQLite Repository Regression
+    runs-on: ubuntu-latest
+    env:
+      APP_ENV: test
+      DATABASE_BACKEND: sqlite
+      RUN_QR_DECODER_TESTS: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Verify QR dependencies
+        run: |
+          python -c "import qrcode, cv2, cryptography; print('dependencies available')"
+
+      - name: Run repository infrastructure tests
+        run: python -m unittest tests.test_repository_infrastructure -v
+
+      - name: Run existing repository tests
+        run: python -m unittest tests.test_repositories -v
+
+      - name: Run timestamp tests
+        run: python -m unittest tests.test_time_handling -v
+
+      - name: Run complete SQLite suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile source and tests
+        run: python -m compileall -q resource_platform tests scripts
+
+  postgresql-repositories:
+    name: PostgreSQL Repository Verification
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: resource_platform_test
+          POSTGRES_USER: resource_test
+          POSTGRES_PASSWORD: ci-only-resource-test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U resource_test -d resource_platform_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      APP_ENV: test
+      DATABASE_BACKEND: postgresql
+      DATABASE_URL: postgresql://resource_test:ci-only-resource-test-password@127.0.0.1:5432/resource_platform_test
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: resource_test
+      PGDATABASE: resource_platform_test
+      PGPASSWORD: ci-only-resource-test-password
+      RUN_QR_DECODER_TESTS: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Verify dependencies
+        run: |
+          python -c "import psycopg, psycopg_pool, qrcode, cv2, cryptography; print('dependencies available')"
+
+      - name: Wait for PostgreSQL
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U "$PGUSER" -d "$PGDATABASE"; then
+              echo "PostgreSQL is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker ps -a
+          exit 1
+
+      - name: Verify PostgreSQL connection
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+          conn = psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=5)
+          try:
+              with conn.cursor() as cur:
+                  cur.execute("SELECT 1")
+                  assert cur.fetchone()[0] == 1
+          finally:
+              conn.close()
+          print("PostgreSQL psycopg connection verified")
+          PY
+
+      - name: Apply PostgreSQL migrations
+        run: |
+          python -m resource_platform.postgresql_migrations migrate --database-url "$DATABASE_URL"
+
+      - name: Verify migration idempotency
+        run: |
+          output="$(python -m resource_platform.postgresql_migrations migrate --database-url "$DATABASE_URL")"
+          echo "PostgreSQL migration rerun completed"
+          echo "$output"
+          echo "$output" | grep -Eq "0 migration\(s\) applied"
+
+      - name: Verify PostgreSQL repository backend selection
+        run: |
+          python - <<'PY'
+          import os
+          from resource_platform.database_backend import PostgreSQLBackend
+          from resource_platform.config import Settings
+          print("selected backend: postgresql")
+          assert os.environ["DATABASE_BACKEND"] == "postgresql"
+          backend = PostgreSQLBackend(os.environ["DATABASE_URL"], min_size=1, max_size=4)
+          assert backend.name == "postgresql"
+          backend.close()
+          PY
+
+      - name: Run PostgreSQL repository tests
+        run: |
+          python -m unittest tests.test_repositories_backend -v
+          python -m unittest tests.test_repository_infrastructure -v
+          python -m unittest tests.test_time_handling -v
+
+      - name: Compile source and tests
+        run: python -m compileall -q resource_platform tests scripts
+
+      - name: Upload PostgreSQL diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: increment5b2-repository-postgresql-diagnostics
+          path: |
+            ${{ runner.temp }}/postgresql-repository.log
+          if-no-files-found: ignore

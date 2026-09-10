@@ -1,0 +1,118 @@
+name: Historical Increment 5A Regression (Current Main)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  increment5a:
+    name: SQLite Backend Abstraction Acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Create clean virtual environment
+        run: python -m venv .venv
+
+      - name: Install project and test dependencies
+        run: |
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[test]"
+
+      - name: Verify test dependencies
+        run: |
+          .venv/bin/python -c "import qrcode, cv2, cryptography; print('dependencies available')"
+
+      - name: Run full test suite with QR decoder enabled
+        env:
+          RUN_QR_DECODER_TESTS: "1"
+        run: |
+          set -o pipefail
+          .venv/bin/python -m unittest discover -s tests -v 2>&1 | tee test-output.log
+          ! grep -E "(^|[[:space:]])(FAILED|ERROR|SKIP|skipped=|failures=|errors=)" test-output.log
+
+      - name: Run compilation checks
+        run: .venv/bin/python -m compileall -q resource_platform tests scripts
+
+      - name: Verify Increment 5A tests explicitly
+        env:
+          RUN_QR_DECODER_TESTS: "1"
+        run: .venv/bin/python -m unittest tests.test_increment5a -v
+
+      - name: Verify SQLite migration idempotency
+        run: |
+          db_path="${RUNNER_TEMP}/increment5a.sqlite3"
+          .venv/bin/python -m resource_platform.database migrate --database-path "$db_path"
+          .venv/bin/python -m resource_platform.database migrate --database-path "$db_path"
+          .venv/bin/python - "$db_path" <<'PY'
+          import sqlite3
+          import sys
+          db_path = sys.argv[1]
+          db = sqlite3.connect(db_path)
+          versions = [row[0] for row in db.execute(
+              "SELECT version FROM schema_migrations ORDER BY version"
+          )]
+          assert versions == [1, 2, 3, 4, 5, 6, 7], versions
+          db.close()
+          print("SQLite migrations verified: 1-7 applied exactly once")
+          PY
+
+      - name: Verify no PostgreSQL runtime claim
+        run: |
+          .venv/bin/python - <<'PY'
+          from resource_platform.config import Settings
+          from resource_platform.database import backend
+          from resource_platform.database_backend import (
+              BackendNotImplementedError,
+              PostgreSQLBackend,
+              parse_database_target,
+          )
+          settings = Settings(
+              environment="development",
+              database_backend="postgresql",
+              database_url="postgresql://test:test@localhost/test",
+              database_path=None,
+              session_secret="test-session-secret",
+              qr_token_encryption_key="",
+              allowed_hosts=("localhost",),
+              host="127.0.0.1",
+              port=8000,
+              cookie_secure=False,
+              log_level="INFO",
+          )
+          validated = settings.validate()
+          assert validated is settings
+          parsed = parse_database_target(
+              backend="postgresql",
+              database_url=settings.database_url,
+          )
+          assert parsed.backend == "postgresql"
+          selected = backend(settings)
+          assert isinstance(selected, PostgreSQLBackend)
+          try:
+              selected.connect()
+          except BackendNotImplementedError as exc:
+              assert "not implemented" in str(exc).lower()
+              print("PostgreSQL placeholder verified: runtime support is not implemented in 5A")
+          else:
+              raise AssertionError("PostgreSQL runtime unexpectedly connected")
+          PY
+
+      - name: Publish test diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: increment5a-test-diagnostics
+          path: test-output.log
+          if-no-files-found: ignore

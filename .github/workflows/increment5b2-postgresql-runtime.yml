@@ -1,0 +1,194 @@
+name: Increment 5B2.1 PostgreSQL Runtime Primitives
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "resource_platform/database_backend.py"
+      - "resource_platform/config.py"
+      - "tests/test_postgresql_backend.py"
+      - "tests/test_increment5a.py"
+      - "pyproject.toml"
+      - ".github/workflows/increment5b2-postgresql-runtime.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  sqlite-regression:
+    name: SQLite Regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m venv .venv
+      - run: |
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[test]"
+      - run: .venv/bin/python -c "import qrcode, cv2, cryptography; print('dependencies available')"
+      - env:
+          RUN_QR_DECODER_TESTS: "1"
+        run: |
+          set -euo pipefail
+          .venv/bin/python -m unittest discover -s tests -v 2>&1 | tee "$RUNNER_TEMP/increment5b2-sqlite-tests.log"
+      - run: .venv/bin/python -m compileall -q resource_platform tests scripts
+      - name: Upload SQLite diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: increment5b2-sqlite-diagnostics
+          path: ${{ runner.temp }}/increment5b2-sqlite-tests.log
+          if-no-files-found: ignore
+
+  postgresql-runtime:
+    name: PostgreSQL 16 Runtime Primitives
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: resource_platform_test
+          POSTGRES_USER: resource_test
+          POSTGRES_PASSWORD: ci-only-resource-test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U resource_test -d resource_platform_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      APP_ENV: test
+      DATABASE_BACKEND: postgresql
+      DATABASE_URL: postgresql://resource_test:ci-only-resource-test-password@127.0.0.1:5432/resource_platform_test
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: resource_test
+      PGDATABASE: resource_platform_test
+      PGPASSWORD: ci-only-resource-test-password
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify workflow revision and service configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Commit SHA: $(git rev-parse HEAD)"
+          echo "Workflow path: .github/workflows/increment5b2-postgresql-runtime.yml"
+          echo "Workflow SHA-256: $(sha256sum .github/workflows/increment5b2-postgresql-runtime.yml | awk '{print $1}')"
+          echo "Working tree status:"
+          git status --short
+          test -f .github/workflows/increment5b2-postgresql-runtime.yml
+          grep -Fq 'pg_isready -h 127.0.0.1 -p 5432' .github/workflows/increment5b2-postgresql-runtime.yml
+          grep -Fq 'PostgreSQL psycopg connection verified' .github/workflows/increment5b2-postgresql-runtime.yml
+          echo "Readiness logic present in checked-out workflow"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m venv .venv
+      - run: |
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[test]"
+      - run: .venv/bin/python -c "import psycopg, psycopg_pool, qrcode, cv2, cryptography; print('dependencies available')"
+      - name: Record QR dependency diagnostics
+        run: |
+          .venv/bin/python - <<'PY'
+          import cv2
+          import importlib.metadata
+          import qrcode
+
+          print(f"qrcode_version={importlib.metadata.version('qrcode')}")
+          print(f"opencv_version={cv2.__version__}")
+          print("QR diagnostics enabled: payloads and tokens are not printed")
+          PY
+      - name: Verify PostgreSQL service
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Docker containers:"
+          docker ps -a
+          readiness_log="$RUNNER_TEMP/increment5b2-readiness.log"
+          : > "$readiness_log"
+          echo "PostgreSQL readiness attempts:" | tee -a "$readiness_log"
+          ready=0
+          for attempt in $(seq 1 30); do
+            echo "Attempt $attempt/30" | tee -a "$readiness_log"
+            if pg_isready -h 127.0.0.1 -p 5432 -U "$PGUSER" -d "$PGDATABASE" 2>&1 | tee -a "$readiness_log"; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "PostgreSQL did not become ready." >&2
+            docker ps -a >&2
+            container_id=$(docker ps -aq --filter ancestor=postgres:16 | head -n 1)
+            if [ -n "$container_id" ]; then
+              docker logs "$container_id" >&2 || true
+            else
+              echo "PostgreSQL container not found" >&2
+            fi
+            exit 1
+          fi
+          echo "PostgreSQL is ready."
+      - name: Verify PostgreSQL connection through psycopg
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python - <<'PY'
+          import os
+          import time
+          import psycopg
+
+          conninfo = os.environ["DATABASE_URL"]
+          last_error = None
+          for attempt in range(1, 31):
+              try:
+                  with psycopg.connect(conninfo, connect_timeout=5) as conn:
+                      with conn.cursor() as cur:
+                          cur.execute("SELECT 1")
+                          assert cur.fetchone() == (1,)
+                  print("PostgreSQL psycopg connection verified")
+                  break
+              except Exception as exc:
+                  last_error = exc
+                  print(f"Waiting for psycopg connection (attempt {attempt}/30): {type(exc).__name__}")
+                  time.sleep(2)
+          else:
+              raise RuntimeError(f"PostgreSQL connection verification failed: {type(last_error).__name__}") from last_error
+          PY
+      - name: Run backend and pool tests
+        run: .venv/bin/python -m unittest tests.test_postgresql_backend tests.test_increment5a -v
+      - name: Compile sources
+        run: .venv/bin/python -m compileall -q resource_platform tests scripts
+      - name: Collect PostgreSQL diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "PostgreSQL service diagnostics"
+            echo "Host: 127.0.0.1"
+            echo "Port: 5432"
+            echo "Database: resource_platform_test"
+            echo "User: resource_test"
+            echo "Container status:"
+            docker ps -a --filter ancestor=postgres:16 --format 'table {{.ID}}\t{{.Status}}\t{{.Ports}}'
+            echo "Readiness output:"
+            if [ -f "$RUNNER_TEMP/increment5b2-readiness.log" ]; then cat "$RUNNER_TEMP/increment5b2-readiness.log"; else echo "Readiness log not found"; fi
+            echo "Container logs:"
+            container_id=$(docker ps -aq --filter ancestor=postgres:16 | head -n 1)
+            if [ -n "$container_id" ]; then docker logs "$container_id"; else echo "PostgreSQL container not found"; fi
+          } > "$RUNNER_TEMP/increment5b2-postgresql-service.log" 2>&1
+      - name: Upload PostgreSQL diagnostics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: increment5b2-postgresql-diagnostics
+          path: ${{ runner.temp }}/increment5b2-postgresql-service.log
+          if-no-files-found: warn

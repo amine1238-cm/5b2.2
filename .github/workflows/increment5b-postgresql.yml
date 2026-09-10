@@ -1,0 +1,72 @@
+name: Increment 5B1 PostgreSQL Schema Acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "migrations_postgresql/**"
+      - "migrations_postgresql.manifest.json"
+      - "resource_platform/postgresql_migrations.py"
+      - "tests/postgresql_migration_acceptance.py"
+      - ".github/workflows/increment5b-postgresql.yml"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  sqlite-regression:
+    name: SQLite Regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m venv .venv
+      - run: |
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[test]"
+      - run: .venv/bin/python -c "import qrcode, cv2, cryptography; print('dependencies available')"
+      - env:
+          RUN_QR_DECODER_TESTS: "1"
+        run: .venv/bin/python -m unittest discover -s tests -v
+      - run: .venv/bin/python -m compileall -q resource_platform tests scripts
+
+  postgres-schema:
+    name: PostgreSQL 16 Schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: resource_platform_test
+          POSTGRES_USER: resource_test
+          POSTGRES_PASSWORD: ci-only-resource-test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U resource_test -d resource_platform_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      DATABASE_URL: postgresql://resource_test:ci-only-resource-test-password@127.0.0.1:5432/resource_platform_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m venv .venv
+      - run: |
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[test]"
+      - run: .venv/bin/python -c "import psycopg, qrcode, cv2, cryptography; print('dependencies available')"
+      - run: .venv/bin/python -m resource_platform.postgresql_migrations migrate --database-url "$DATABASE_URL"
+      - run: .venv/bin/python -m resource_platform.postgresql_migrations migrate --database-url "$DATABASE_URL"
+      - run: .venv/bin/python -m unittest tests.postgresql_migration_acceptance -v
+      - run: .venv/bin/python -m compileall -q resource_platform tests scripts

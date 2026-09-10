@@ -1,0 +1,26 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.secret
+secrets/
+
+# Local databases
+*.sqlite3
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*
+
+# Test/build artifacts
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+*.log
+*.pyc
